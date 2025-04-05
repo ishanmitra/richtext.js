@@ -1,0 +1,565 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1.0">
+	<title>Document</title>
+	<style>
+		.md-symbol {
+			opacity: 0.5;
+		}
+
+		[contenteditable]:focus {
+			outline: 0px solid transparent;
+		}
+
+		#status {
+			width: -webkit-fill-available;
+			font-family: monospace;
+			font-size: 5px;
+			position: fixed;
+			left: 0;
+			bottom: 0;
+			max-height: 25vh;
+			overflow: auto;
+			backdrop-filter: blur(1px);
+			background-color: #d3d3d359;
+			padding-top: 5px;
+			padding-left: 5px;
+			padding-right: 5px;
+		}
+	</style>
+</head>
+
+<body>
+	
+	<div><span id="editor" contenteditable>Hello!</span></div>
+	<div id="status">
+		<div >Mirror:</div>
+		<div id="mirror"></div>
+		<div id="edit"></div>
+		<div id="active"></div>
+		<div id="cursor"></div>
+		<div id="textcursor"></div>
+		<div id="history"></div>
+		<div id="editstatus"></div>
+		<div id="delmirr"></div>
+		</div>
+	</div>
+
+	<script>
+		// const status = document.getElementById("status");
+		const editor = document.getElementById("editor");
+		const mirror = document.getElementById("mirror");
+		const history = document.getElementById("history");
+		const active = document.getElementById("active");
+		const cursor = document.getElementById("cursor");
+		const textcursor = document.getElementById("textcursor");
+		const editstatus = document.getElementById("editstatus");
+		const delmirr = document.getElementById("delmirr");
+
+		var textstack = [
+			["Hello!", 0, 6, "start"]
+		];
+		var redoStack = []; // states undone, ready to be redone
+
+		var edit = false;
+		var editState = "ins";
+		var cursorOrSelection = -1;
+
+		var keyInputStatus = "broken";
+		var keyInputStartPos = -1;
+		var keyInputEndPos = -1;
+
+		// Stores text from mirror when deletion happens
+		var delMirror = ""
+
+		function showDelMirr() {
+			history.innerHTML = "Del Mirror" + delMirror;
+		}
+
+		function showHistory() {
+			history.innerHTML = "History<br>" + textstack;
+		}
+
+		function showEdit() {
+			active.innerHTML = "Edit active " + edit;
+		}
+
+		function showEditStatus() {
+			editstatus.innerHTML = "Edit status " + editState;
+		}
+
+		function getCursorOrSelectionOffsets(element) {
+			const selection = window.getSelection();
+			if (!selection.rangeCount) return -1;
+
+			const range = selection.getRangeAt(0);
+			const preCaretRange = range.cloneRange();
+			preCaretRange.selectNodeContents(element);
+			preCaretRange.setEnd(range.endContainer, range.endOffset);
+
+			let start = getTextLengthWithBreaks(preCaretRange);
+
+			if (selection.isCollapsed) {
+				return start;
+			}
+
+			// Selection exists: get the end position
+			const preCaretRangeEnd = range.cloneRange();
+			preCaretRangeEnd.selectNodeContents(element);
+			preCaretRangeEnd.setEnd(range.startContainer, range.startOffset);
+
+			let end = getTextLengthWithBreaks(preCaretRangeEnd);
+
+			return [Math.min(start, end), Math.max(start, end)];
+		}
+
+		function getTextLengthWithBreaks(range) {
+			let length = 0;
+			const endContainer = range.endContainer;
+			const endOffset = range.endOffset;
+
+			const walker = document.createTreeWalker(
+				range.commonAncestorContainer,
+				NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT,
+				{
+					acceptNode(node) {
+						return range.intersectsNode(node)
+							? NodeFilter.FILTER_ACCEPT
+							: NodeFilter.FILTER_REJECT;
+					}
+				}
+			);
+
+			while (walker.nextNode()) {
+				const node = walker.currentNode;
+
+				if (node.nodeType === Node.TEXT_NODE) {
+					if (node === endContainer) {
+						// Only count up to the caret position
+						length += endOffset;
+						break; // Stop after reaching endContainer
+					} else {
+						length += node.nodeValue.length;
+					}
+				} else if (node.nodeName === "BR") {
+					length++;
+				}
+			}
+
+			return length;
+		}
+
+
+		// Break handler
+		// Push the last action to the textstack
+		function breakHandler() {
+			// If keystrokes exist before breaking
+			// Push the text state
+			if (keyInputStartPos !== -1 && keyInputEndPos !== -1) {
+				if (editState == "ins") {
+					textstack.push([
+						editor.innerText.substring(keyInputStartPos, keyInputEndPos),
+						keyInputStartPos,
+						keyInputEndPos,
+						editState
+					])
+				} else if (editState == "delBack") {
+					textstack.push([
+						delMirror.substring(keyInputStartPos, keyInputEndPos),
+						keyInputStartPos,
+						keyInputEndPos,
+						editState
+					])
+				} else if (editState == "delFwd") {
+					textstack.push([
+						delMirror.substring(keyInputStartPos, keyInputEndPos),
+						keyInputStartPos,
+						keyInputStartPos, // Yeah they stay the same
+						editState
+					])
+				} else if (editState == "enter") {
+
+					textstack.push([
+						"\n",
+						keyInputStartPos,
+						keyInputStartPos + 1,
+						editState
+					])
+				}
+			} 
+
+			// Reset these positions (nothing to push to stack)
+			keyInputStartPos = -1
+			keyInputEndPos = -1
+
+			// Reset typing status to broken
+			keyInputStatus = "broken"
+
+
+
+			// Update the keyboard typing positions
+			showTextCursor()
+		}
+
+		function handleUndo() {
+			if (keyInputStatus !== "broken") {
+				breakHandler();
+			}
+
+			if (textstack.length === 1) {
+
+				event.preventDefault();
+				return;	
+			}
+
+			const lastAction = textstack.pop();
+
+			redoStack.push(lastAction); // Save current state for redo
+
+			reverseAction(lastAction); // Actually undo it
+		}
+
+		function handleRedo() {
+			if (redoStack.length === 0) return;
+
+			const nextAction = redoStack.pop();
+			textstack.push(nextAction); // Save current state for undo
+
+			applyAction(nextAction); // Redo the previously undone action
+		}
+
+		function reverseAction(action) {
+			text = action[0]
+			start_pos = action[1]
+			end_pos = action[2]
+			method = action[3]
+
+			if (method === "ins") {
+				deleteText(start_pos, end_pos);
+				setCursorPosition(editor, start_pos);
+			} else if (method === "delBack" || method === "delFront") {
+				insertText(text, start_pos);
+				setCursorPosition(editor, start_pos)
+			} else if (method === "enter") {
+				deleteText(start_pos, end_pos);
+				setCursorPosition(editor, start_pos);
+			}
+		}
+
+		function applyAction(action) {
+			text = action[0]
+			start_pos = action[1]
+			end_pos = action[2]
+			method = action[3]
+
+			if (method === "ins") {
+				insertText(text, start_pos);
+				setCursorPosition(editor, end_pos)
+			} else if (method === "delBack" || method === "delFront") {
+				deleteText(start_pos, end_pos);
+				setCursorPosition(editor, end_pos)
+			} else if (method === "enter") {
+				insertText("\n", start_pos);
+				setCursorPosition(editor, end_pos);
+			}
+		}
+
+		function deleteText(start, end) {
+			const range = document.createRange();
+			const sel = window.getSelection();
+			range.setStart(mirror.firstChild, start);
+			range.setEnd(mirror.firstChild, end);
+			range.deleteContents();
+			editor.innerHTML = formatMarkdown(mirror.innerText);
+		}
+
+		function insertText(text, pos) {
+			const newText = mirror.innerText.slice(0, pos) + text + mirror.innerText.slice(pos);
+			// node.textContent = newText;
+			mirror.innerText = newText;
+			editor.innerHTML = formatMarkdown(mirror.innerText);
+		}
+
+		function updateCursorOnInteraction() {
+			if (keyInputStatus !== "broken") {
+				breakHandler();
+			}
+
+			const handleMouseUp = () => {
+				cursorOrSelection = getCursorOrSelectionOffsets(editor);
+				if (cursorOrSelection !== -1) {
+					showCursor(cursorOrSelection);
+				}
+			};
+			document.addEventListener("mouseup", handleMouseUp, { once: true });
+		}
+
+		editor.addEventListener("focus", () => {
+			edit = true;
+			showEdit();
+			updateCursorOnInteraction();
+		});
+
+		editor.addEventListener("blur", () => {
+			edit = false;
+			if (keyInputStatus !== "broken") {
+				breakHandler();
+			}
+			showEdit();
+			showCursor(-1);
+		});
+
+		editor.addEventListener("mousedown", updateCursorOnInteraction);
+
+		editor.addEventListener("keydown", () => {
+			const navigationKeys = ["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End"];
+    
+			if (navigationKeys.includes(event.key)) {
+				// Handle cursor movement logic here
+				if (keyInputStatus !== "broken") {
+					breakHandler()
+				}
+			}
+		});
+
+		document.addEventListener("selectionchange", () => {
+			cursorOrSelection = getCursorOrSelectionOffsets(editor);
+			if (cursorOrSelection !== -1) {
+				showCursor(cursorOrSelection);
+			}
+		});
+
+		function showMirror() {
+			mirror.innerText = editor.innerText
+		}
+
+		editor.addEventListener("beforeinput", (event) => {
+			setCursorPosition(editor, cursorOrSelection)
+
+			// When letters are typed
+			if (event.inputType == "insertText") {
+				// Clear the redoStack
+				redoStack.length = 0
+
+				if (editState !== "ins") {
+					breakHandler();
+				}
+				editState = "ins";
+				showEditStatus()
+				// Initialize values if starting from a broken status
+				if (keyInputStatus == "broken") {
+					keyInputStatus = "type"
+					keyInputStartPos = cursorOrSelection
+					keyInputEndPos = keyInputStartPos + 1
+				} else {
+					keyInputEndPos = keyInputEndPos + 1
+				}
+			}
+			// When Enter is pressed
+			if (event.inputType == "insertParagraph") {
+				// Clear the redoStack
+				redoStack.length = 0
+
+				// Push any pending state to the history stack
+				temp = cursorOrSelection
+				if (editState !== "enter") {
+					breakHandler();
+				}
+				editState = "enter";
+				keyInputStartPos = temp;
+				keyInputEndPos = keyInputStartPos + 1
+				
+				// Push enter logs to the history stack
+				breakHandler();
+				showEditStatus()
+			}
+			// When backspace is pushed
+			if (event.inputType == "deleteContentBackward") {
+				// Clear the redoStack
+				redoStack.length = 0
+
+				if (editState !== "delBack") {
+					delMirror = mirror.innerText // Copy the full text in memory
+
+					showDelMirr()
+					breakHandler();
+				}
+				editState = "delBack";
+				showEditStatus()
+				// Initialize values if starting from a broken status
+				if (keyInputStatus == "broken") {
+					keyInputStatus = "delBack"
+					keyInputStartPos = cursorOrSelection
+					keyInputEndPos = keyInputStartPos - 1
+				} else {
+					keyInputEndPos = keyInputEndPos - 1
+				}
+			}
+			// When Delete key is pushed
+			if (event.inputType == "deleteContentForward") {
+				// Clear the redoStack
+				redoStack.length = 0
+
+				if (editState !== "delFwd") {
+					delMirror = mirror.innerText // Copy the full text in memory
+
+					showDelMirr()
+					breakHandler();
+				}
+				editState = "delFwd";
+				showEditStatus()
+				// Initialize values if starting from a broken status
+				if (keyInputStatus == "broken") {
+					keyInputStatus = "delFwd"
+					keyInputStartPos = cursorOrSelection
+					keyInputEndPos = cursorOrSelection + 1 // Yes the cursor does not shift to the right, but we are doing this for the substring logic
+				} else {
+					keyInputEndPos = keyInputEndPos + 1
+				}
+			}
+			// Ctrl+Z or Undo option is selected
+			if (event.inputType === "historyUndo") {
+
+				breakHandler();
+				handleUndo();
+			}
+			// Ctrl+Y or Redo option is selected
+			if (event.inputType === "historyRedo") {
+
+				handleRedo();
+			}
+			showTextCursor()
+		});
+
+		function setCursorPosition(el, position) {
+			const range = document.createRange();
+			const selection = window.getSelection();
+
+			el.focus(); // Ensure the element is focused
+
+			let currentPos = 0;
+			let found = false;
+
+			function findNode(node) {
+				if (node.nodeType === Node.TEXT_NODE) {
+					let textLength = node.length;
+
+					if (currentPos + textLength >= position) {
+						range.setStart(node, position - currentPos);
+						range.collapse(true);
+						found = true;
+						return;
+					}
+					currentPos += textLength;
+				} else if (node.nodeName === "BR") {
+					// Handle <br> as a single character
+					if (currentPos === position) {
+						range.setStartAfter(node);
+						range.collapse(true);
+						found = true;
+						return;
+					}
+					currentPos++;
+				} else {
+					for (let child of node.childNodes) {
+						findNode(child);
+						if (found) return;
+					}
+				}
+			}
+
+			findNode(el); // Start from the root element
+
+			if (found) {
+				selection.removeAllRanges();
+				selection.addRange(range);
+			}
+		}
+
+		function formatMarkdown(text) {
+			const symbolPlaceholder = { '*': '{{S1}}', '_': '{{S2}}', '~': '{{S3}}' }; // Prevent re-processing
+			const symbolClass = "md-symbol"; // Class for markdown symbols
+
+			// Step 1: Apply Markdown transformations in order of precedence
+			text = text
+				// Step 1a: Bold + Italics + Strikethrough (*_~text~_*, _*~text~*_, etc.)
+				.replace(/\*~_(\S(?:.*?\S)?)_~\*/g, `${symbolPlaceholder['*']}${symbolPlaceholder['~']}${symbolPlaceholder['_']}<strong><em><del>$1</del></em></strong>${symbolPlaceholder['_']}${symbolPlaceholder['~']}${symbolPlaceholder['*']}`)
+				.replace(/\*_~(\S(?:.*?\S)?)~_\*/g, `${symbolPlaceholder['*']}${symbolPlaceholder['_']}${symbolPlaceholder['~']}<strong><em><del>$1</del></em></strong>${symbolPlaceholder['~']}${symbolPlaceholder['_']}${symbolPlaceholder['*']}`)
+				.replace(/_\*~(\S(?:.*?\S)?)~\*_/g, `${symbolPlaceholder['_']}${symbolPlaceholder['*']}${symbolPlaceholder['~']}<strong><em><del>$1</del></em></strong>${symbolPlaceholder['~']}${symbolPlaceholder['*']}${symbolPlaceholder['_']}`)
+				.replace(/_~\*(\S(?:.*?\S)?)\*_~/g, `${symbolPlaceholder['_']}${symbolPlaceholder['~']}${symbolPlaceholder['*']}<strong><em><del>$1</del></em></strong>${symbolPlaceholder['*']}${symbolPlaceholder['~']}${symbolPlaceholder['_']}`)
+				.replace(/~\*_([\S](?:.*?\S)?)_\*~/g, `${symbolPlaceholder['~']}${symbolPlaceholder['*']}${symbolPlaceholder['_']}<strong><em><del>$1</del></em></strong>${symbolPlaceholder['_']}${symbolPlaceholder['*']}${symbolPlaceholder['~']}`)
+				.replace(/~_\*(\S(?:.*?\S)?)\*_~/g, `${symbolPlaceholder['~']}${symbolPlaceholder['_']}${symbolPlaceholder['*']}<strong><em><del>$1</del></em></strong>${symbolPlaceholder['*']}${symbolPlaceholder['_']}${symbolPlaceholder['~']}`)
+
+				// Step 1b: Bold + Italics (*_text_*, _*text*_)
+				.replace(/\*_(\S(?:.*?\S)?)_\*/g, `${symbolPlaceholder['*']}${symbolPlaceholder['_']}<strong><em>$1</em></strong>${symbolPlaceholder['_']}${symbolPlaceholder['*']}`)
+				.replace(/_\*(\S(?:.*?\S)?)\*_/g, `${symbolPlaceholder['_']}${symbolPlaceholder['*']}<strong><em>$1</em></strong>${symbolPlaceholder['*']}${symbolPlaceholder['_']}`)
+
+				// Step 1c: Italics + Strikethrough (_~text~_, ~_text_~)
+				.replace(/_~(\S(?:.*?\S)?)~_/g, `${symbolPlaceholder['_']}${symbolPlaceholder['~']}<em><del>$1</del></em>${symbolPlaceholder['~']}${symbolPlaceholder['_']}`)
+				.replace(/~_(\S(?:.*?\S)?)_~/g, `${symbolPlaceholder['~']}${symbolPlaceholder['_']}<em><del>$1</del></em>${symbolPlaceholder['_']}${symbolPlaceholder['~']}`)
+
+				// Step 1d: Bold + Strikethrough (*~text~*, ~*text*~)
+				.replace(/\*~(\S(?:.*?\S)?)~\*/g, `${symbolPlaceholder['*']}${symbolPlaceholder['~']}<strong><del>$1</del></strong>${symbolPlaceholder['~']}${symbolPlaceholder['*']}`)
+				.replace(/~\*(\S(?:.*?\S)?)\*~/g, `${symbolPlaceholder['~']}${symbolPlaceholder['*']}<strong><del>$1</del></strong>${symbolPlaceholder['*']}${symbolPlaceholder['~']}`)
+
+				// Step 1e: Regular Bold (*text*)
+				.replace(/\*(\S(?:.*?\S)?)\*/g, `${symbolPlaceholder['*']}<strong>$1</strong>${symbolPlaceholder['*']}`)
+
+				// Step 1f: Regular Italics (_text_)
+				.replace(/_(\S(?:.*?\S)?)_/g, `${symbolPlaceholder['_']}<em>$1</em>${symbolPlaceholder['_']}`)
+
+				// Step 1g: Regular Strikethrough (~text~)
+				.replace(/~(\S(?:.*?\S)?)~/g, `${symbolPlaceholder['~']}<del>$1</del>${symbolPlaceholder['~']}`)
+
+				// Step 1h: Replace newlines with <br>
+				.replace(/\n/g, '<br>');
+
+			// Step 2: Replace placeholders back with visible span elements
+			text = text
+				.replace(/{{S1}}/g, `<span class="${symbolClass}">*</span>`)
+				.replace(/{{S2}}/g, `<span class="${symbolClass}">_</span>`)
+				.replace(/{{S3}}/g, `<span class="${symbolClass}">~</span>`);
+
+			return text;
+		}
+
+		editor.addEventListener("input", (event) => {
+			showMirror()
+
+			
+			// Update cursor selection after updating text
+			cursorOrSelection = getCursorOrSelectionOffsets(editor);
+			if (cursorOrSelection !== -1) {
+				showCursor(cursorOrSelection);
+			}
+
+
+			editor.innerHTML = formatMarkdown(mirror.innerText)
+			setCursorPosition(editor, cursorOrSelection)
+		});
+		
+		function showCursor() {
+			if (edit) {
+				cursor.innerHTML = "Cursor position " + cursorOrSelection;
+			} else {
+				cursor.innerHTML = "Textbox inactive";
+			}
+
+		}
+
+		function showTextCursor() {
+			textcursor.innerHTML = "Text positions: First " + keyInputStartPos + " Last " + keyInputEndPos;
+		}
+
+		showEdit()
+		showCursor()
+		showMirror()
+		showEditStatus()
+		showTextCursor()
+		showDelMirr()
+	</script>
+</body>
+</html>
